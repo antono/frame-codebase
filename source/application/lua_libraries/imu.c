@@ -293,8 +293,10 @@ static void imu_apply_tap_settings(void)
     check_error(i2c_read(ACCELEROMETER, 0x03, 0xFF).fail);
 }
 
-static const uint16_t tap_rate_hz[] = {32, 16, 8, 4, 2, 1, 0, 0,
-                                       64, 128, 256};
+// Indexed by the RATE[3:0] field. Zero marks a code with no whole-number Hz
+// value (0.5 and 0.25 Hz) or a reserved one, and is never selectable.
+static const uint16_t tap_rate_hz[16] = {32, 16, 8, 4, 2, 1, 0, 0,
+                                         64, 128, 256, 0, 0, 0, 0, 0};
 
 static int lua_imu_tap_config(lua_State *L)
 {
@@ -363,9 +365,12 @@ static int lua_imu_tap_config(lua_State *L)
     if (lua_getfield(L, 1, "axes") != LUA_TNIL)
     {
         lua_Integer value = luaL_checkinteger(L, -1);
-        if (value < 0 || value > 0x3F)
+        // Zero would disable tap detection outright. Taps are the only input
+        // the glasses have besides orientation, so that is a lockout until
+        // the next reset; refuse it rather than offer the foot-gun.
+        if (value < 1 || value > 0x3F)
         {
-            luaL_error(L, "axes must be between 0 and 0x3F");
+            luaL_error(L, "axes must be between 1 and 0x3F");
         }
         tap_settings.axes = (uint8_t)value;
     }
