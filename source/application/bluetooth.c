@@ -82,6 +82,22 @@ static struct bond_information_t
 
 bool flash_write_in_progress = false;
 
+// An erased (all 0xFF) key in flash means the glasses have never been paired
+static bool is_bonded(void)
+{
+    for (size_t i = 0;
+         i < sizeof(bond.keyset.keys_own.p_enc_key->enc_info.ltk);
+         i++)
+    {
+        if (bond.keyset.keys_own.p_enc_key->enc_info.ltk[i] != 0xff)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 uint16_t ble_negotiated_mtu;
 
 static void softdevice_assert_handler(uint32_t id, uint32_t pc, uint32_t info)
@@ -153,8 +169,16 @@ void SD_EVT_IRQHandler(void)
                                                   0,
                                                   0));
 
-            check_error(sd_ble_gap_authenticate(ble_handles.connection,
-                                                &bond.sec_param));
+            // Bonded: ask the phone to encrypt with the stored key straight
+            // away. Not yet bonded: leave pairing to the phone, which starts
+            // it on its first encrypted access. A security request here would
+            // race the phone's own MTU exchange and service discovery, and
+            // Android then shows its pairing dialog twice.
+            if (is_bonded())
+            {
+                check_error(sd_ble_gap_authenticate(ble_handles.connection,
+                                                    &bond.sec_param));
+            }
 
             break;
         }
@@ -275,19 +299,7 @@ void SD_EVT_IRQHandler(void)
 
         case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
         {
-            size_t bonded = 0;
-
-            for (size_t i = 0;
-                 i < sizeof(bond.keyset.keys_own.p_enc_key->enc_info.ltk);
-                 i++)
-            {
-                if (bond.keyset.keys_own.p_enc_key->enc_info.ltk[i] == 0xff)
-                {
-                    bonded++;
-                }
-            }
-
-            if (bonded == sizeof(bond.keyset.keys_own.p_enc_key->enc_info.ltk))
+            if (!is_bonded())
             {
                 check_error(sd_ble_gap_sec_params_reply(
                     ble_handles.connection,
