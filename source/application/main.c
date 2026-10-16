@@ -33,6 +33,7 @@
 #include "fpga_application.h"
 #include "i2c.h"
 #include "luaport.h"
+#include "main.h"
 #include "nrf_clock.h"
 #include "nrf_gpio.h"
 #include "nrf_sdm.h"
@@ -102,10 +103,15 @@ void shutdown(bool enable_imu_wakeup)
     // Put magnetometer into standby
     check_error(i2c_write(MAGNETOMETER, 0x1B, 0x80, 0x00).fail);
 
-    // Put accelerometer into standby if not needed for wakeup
+    // Put accelerometer into standby if not needed for wakeup, otherwise
+    // leave it set up so that one tap wakes the glasses
     if (!enable_imu_wakeup)
     {
         check_error(i2c_write(ACCELEROMETER, 0x07, 0xFF, 0x00).fail);
+    }
+    else
+    {
+        imu_prepare_wakeup();
     }
 
     nrf_gpio_pin_clear(FPGA_PROGRAM_PIN);

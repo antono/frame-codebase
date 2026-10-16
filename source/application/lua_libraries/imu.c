@@ -218,30 +218,227 @@ static int lua_imu_raw(lua_State *L)
     return 1;
 }
 
-void lua_open_imu_library(lua_State *L)
+// MC6470 tap configuration. The accelerometer detects taps in hardware; these
+// registers decide how forgiving it is. Datasheet sections 9.6 to 9.8.
+//
+//   0x07 MODE   IAH IPP ... OPCON[1:0]    0xC0 standby, 0xC1 wake
+//   0x08 SRTFR  TAP_LATCH | FLIP_* | RATE[3:0]
+//   0x09 TAPEN  TAP_EN | THRDUR | per-axis enables
+//   0x0A-0x0C   THRDUR=1 -> threshold; THRDUR=0 -> QUIET[7:4] | DUR[3:0]
+//
+// Each of 0x0A to 0x0C is two registers in one, selected by THRDUR. Stock
+// firmware only ever wrote the threshold, leaving QUIET and DUR at their
+// power-on zero: no enforced silence after a tap, so the frame ringing after
+// a knock registers as further taps. Writing both halves is the point here.
+typedef struct
 {
-    // NOTE: IMU must be repowered after changing these settings
+    uint8_t rate;       // RATE[3:0] field value; 0x0A is 256 Hz
+    bool latch;         // TAP_LATCH: ignore further taps until 0x03 is read
+    uint8_t axes;       // TAPEN bits 5:0, also mirrored into INTEN
+    uint8_t threshold;  // written while THRDUR = 1
+    uint8_t quiet;      // 0..15, high nibble while THRDUR = 0
+    uint8_t duration;   // 0..15, low nibble while THRDUR = 0
+} tap_settings_t;
 
-    // Enable tap interrupt on -Y axis
-    check_error(i2c_write(ACCELEROMETER, 0x06, 0xFF, 0x08).fail);
+static const tap_settings_t tap_defaults = {
+    .rate = 0x0A,       // 256 Hz
+    .latch = true,
+    .axes = 0x08,       // -Y only, which is how the part is mounted
+    .threshold = 0x07,
+    .quiet = 0,         // stock values: no quiet period, no minimum duration
+    .duration = 0,
+};
 
-    // Ignore multiple taps and set sample rate to 256Hz
-    check_error(i2c_write(ACCELEROMETER, 0x08, 0xFF, 0x8A).fail);
+static tap_settings_t tap_settings = tap_defaults;
 
-    // Enable tap interrupts on -Y axis in threshold mode
-    check_error(i2c_write(ACCELEROMETER, 0x09, 0xFF, 0xC8).fail);
+static void imu_apply_tap_settings(void)
+{
+    // Tap configuration only takes effect from standby. The original code
+    // did this once at boot and documented it as "IMU must be repowered
+    // after changing these settings"; doing the full cycle here is what
+    // makes the settings changeable at runtime.
+    check_error(i2c_write(ACCELEROMETER, 0x07, 0xFF, 0xC0).fail);
 
-    // Configure tap threshold on Y axis
-    check_error(i2c_write(ACCELEROMETER, 0x0B, 0xFF, 0x07).fail);
+    // Interrupt enables must track the detection axes
+    check_error(i2c_write(ACCELEROMETER, 0x06, 0xFF, tap_settings.axes).fail);
 
-    // Configure 14bit mode
-    check_error(i2c_write(ACCELEROMETER, 0x20, 0xFF, 0x05).fail);
+    uint8_t srtfr = (tap_settings.latch ? 0x80 : 0x00) |
+                    (tap_settings.rate & 0x0F);
+    check_error(i2c_write(ACCELEROMETER, 0x08, 0xFF, srtfr).fail);
+
+    // THRDUR = 0: 0x0A-0x0C are quiet (high nibble) and duration (low)
+    uint8_t quiet_dur = ((tap_settings.quiet & 0x0F) << 4) |
+                        (tap_settings.duration & 0x0F);
+    check_error(i2c_write(ACCELEROMETER, 0x09, 0xFF,
+                          0x80 | (tap_settings.axes & 0x3F))
+                    .fail);
+    check_error(i2c_write(ACCELEROMETER, 0x0A, 0xFF, quiet_dur).fail);
+    check_error(i2c_write(ACCELEROMETER, 0x0B, 0xFF, quiet_dur).fail);
+    check_error(i2c_write(ACCELEROMETER, 0x0C, 0xFF, quiet_dur).fail);
+
+    // THRDUR = 1: the same addresses now hold the threshold
+    check_error(i2c_write(ACCELEROMETER, 0x09, 0xFF,
+                          0xC0 | (tap_settings.axes & 0x3F))
+                    .fail);
+    check_error(i2c_write(ACCELEROMETER, 0x0A, 0xFF,
+                          tap_settings.threshold)
+                    .fail);
+    check_error(i2c_write(ACCELEROMETER, 0x0B, 0xFF,
+                          tap_settings.threshold)
+                    .fail);
+    check_error(i2c_write(ACCELEROMETER, 0x0C, 0xFF,
+                          tap_settings.threshold)
+                    .fail);
 
     // Set INTA as push-pull active-high and come out of standby
     check_error(i2c_write(ACCELEROMETER, 0x07, 0xFF, 0xC1).fail);
 
     // Clear interrupts
     check_error(i2c_read(ACCELEROMETER, 0x03, 0xFF).fail);
+}
+
+// Called by shutdown() before System OFF, when a tap is what wakes the
+// glasses. The accelerometer sleeps as it was last set, so a harder
+// threshold or a long duration from tap_config took many taps to wake them,
+// or none did; and a tap still latched (TAP_LATCH holds INTA until 0x03 is
+// read) keeps the wake-up line where no new tap can move it. Seen: with the
+// stock IMU code the glasses would not wake at all. So the boot defaults go
+// back, which clears the latch, and it is cleared once more after the frame
+// has stopped ringing from the tap that sent the glasses to sleep.
+void imu_prepare_wakeup(void)
+{
+    nrfx_gpiote_trigger_disable(IMU_INTERRUPT_PIN);
+
+    tap_settings = tap_defaults;
+    imu_apply_tap_settings();
+
+    nrfx_systick_delay_ms(300);
+    check_error(i2c_read(ACCELEROMETER, 0x03, 0xFF).fail);
+}
+
+// Indexed by the RATE[3:0] field. Zero marks a code with no whole-number Hz
+// value (0.5 and 0.25 Hz) or a reserved one, and is never selectable.
+static const uint16_t tap_rate_hz[16] = {32, 16, 8, 4, 2, 1, 0, 0,
+                                         64, 128, 256, 0, 0, 0, 0, 0};
+
+static int lua_imu_tap_config(lua_State *L)
+{
+    // No argument: report what is programmed, so a calibration app can show
+    // the current values and round-trip them.
+    if (lua_gettop(L) == 0)
+    {
+        lua_newtable(L);
+
+        lua_pushinteger(L, tap_settings.threshold);
+        lua_setfield(L, -2, "threshold");
+
+        lua_pushinteger(L, tap_settings.quiet);
+        lua_setfield(L, -2, "quiet");
+
+        lua_pushinteger(L, tap_settings.duration);
+        lua_setfield(L, -2, "duration");
+
+        lua_pushboolean(L, tap_settings.latch);
+        lua_setfield(L, -2, "latch");
+
+        lua_pushinteger(L, tap_settings.axes);
+        lua_setfield(L, -2, "axes");
+
+        lua_pushinteger(L, tap_rate_hz[tap_settings.rate & 0x0F]);
+        lua_setfield(L, -2, "rate");
+
+        return 1;
+    }
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    if (lua_getfield(L, 1, "threshold") != LUA_TNIL)
+    {
+        lua_Integer value = luaL_checkinteger(L, -1);
+        if (value < 0 || value > 255)
+        {
+            luaL_error(L, "threshold must be between 0 and 255");
+        }
+        tap_settings.threshold = (uint8_t)value;
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 1, "quiet") != LUA_TNIL)
+    {
+        lua_Integer value = luaL_checkinteger(L, -1);
+        if (value < 0 || value > 15)
+        {
+            luaL_error(L, "quiet must be between 0 and 15");
+        }
+        tap_settings.quiet = (uint8_t)value;
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 1, "duration") != LUA_TNIL)
+    {
+        lua_Integer value = luaL_checkinteger(L, -1);
+        if (value < 0 || value > 15)
+        {
+            luaL_error(L, "duration must be between 0 and 15");
+        }
+        tap_settings.duration = (uint8_t)value;
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 1, "axes") != LUA_TNIL)
+    {
+        lua_Integer value = luaL_checkinteger(L, -1);
+        // Zero would disable tap detection outright. Taps are the only input
+        // the glasses have besides orientation, so that is a lockout until
+        // the next reset; refuse it rather than offer the foot-gun.
+        if (value < 1 || value > 0x3F)
+        {
+            luaL_error(L, "axes must be between 1 and 0x3F");
+        }
+        tap_settings.axes = (uint8_t)value;
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 1, "latch") != LUA_TNIL)
+    {
+        tap_settings.latch = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 1, "rate") != LUA_TNIL)
+    {
+        lua_Integer value = luaL_checkinteger(L, -1);
+        bool found = false;
+
+        for (uint8_t code = 0; code < sizeof(tap_rate_hz) / sizeof(uint16_t);
+             code++)
+        {
+            if (tap_rate_hz[code] != 0 && tap_rate_hz[code] == value)
+            {
+                tap_settings.rate = code;
+                found = true;
+                break;
+            }
+        }
+
+        if (found == false)
+        {
+            luaL_error(L, "rate must be 1, 2, 4, 8, 16, 32, 64, 128 or 256");
+        }
+    }
+    lua_pop(L, 1);
+
+    imu_apply_tap_settings();
+
+    return 0;
+}
+
+void lua_open_imu_library(lua_State *L)
+{
+    // Configure 14bit mode
+    check_error(i2c_write(ACCELEROMETER, 0x20, 0xFF, 0x05).fail);
+
+    imu_apply_tap_settings();
 
     // Configure tap pin interrupt
     nrfx_gpiote_input_config_t input_config = {
@@ -272,6 +469,9 @@ void lua_open_imu_library(lua_State *L)
 
     lua_pushcfunction(L, lua_imu_tap_callback);
     lua_setfield(L, -2, "tap_callback");
+
+    lua_pushcfunction(L, lua_imu_tap_config);
+    lua_setfield(L, -2, "tap_config");
 
     lua_pushcfunction(L, lua_imu_direction);
     lua_setfield(L, -2, "direction");

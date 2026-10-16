@@ -30,5 +30,6 @@ extern bool not_real_hardware;
 extern bool stay_awake;
 
 void shutdown(bool enable_imu_wakeup);
+void imu_prepare_wakeup(void);
 
 const char *get_hardware_string(void);
