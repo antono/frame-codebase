@@ -122,6 +122,13 @@ async def main():
     await test.lua_send("frame.file.remove('test2.lua')")
     await test.lua_equals("#frame.file.listdir('/')", "2")
 
+    ## Space on the filesystem, in bytes
+    await test.lua_equals("frame.file.space().total > 0", "true")
+    await test.lua_equals(
+        "frame.file.space().used + frame.file.space().free == frame.file.space().total",
+        "true",
+    )
+
     ## Create and delete directories
     await test.lua_send("frame.file.mkdir('/this/is/some/path')")
 
