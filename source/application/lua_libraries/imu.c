@@ -316,10 +316,55 @@ void imu_prepare_wakeup(void)
     check_error(i2c_read(ACCELEROMETER, 0x03, 0xFF).fail);
 }
 
+// Waking takes two taps. The accelerometer has no double-tap detection, and
+// a sleeping nRF cannot count, so the first tap wakes the glasses and this
+// waits for the second one early in boot, before the FPGA, display or
+// Bluetooth are powered. Without it the glasses go straight back to sleep:
+// one knock -- a bag, a table, putting them on -- woke them far too often.
+//
+// The frame rings after a tap, and the wake-up settings have no quiet
+// period, so hits in the first WAKE_TAP_MUTE_MS are the same tap ringing.
+// Times are from the moment this starts, a few tens of ms after the first
+// tap (the bootloader skips its CRC check when waking from System OFF).
+#define WAKE_TAP_MUTE_MS 150
+#define WAKE_TAP_WINDOW_MS 900
+
+bool imu_woke_by_tap = false;
+
+bool imu_wait_for_second_tap(void)
+{
+    // The waking tap is still latched; reading 0x03 drops it and re-arms
+    check_error(i2c_read(ACCELEROMETER, 0x03, 0xFF).fail);
+
+    for (uint32_t ms = 0; ms < WAKE_TAP_WINDOW_MS; ms += 10)
+    {
+        nrfx_systick_delay_ms(10);
+
+        i2c_response_t status = i2c_read(ACCELEROMETER, 0x03, 0xFF);
+        check_error(status.fail);
+
+        if (status.value && ms >= WAKE_TAP_MUTE_MS)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Indexed by the RATE[3:0] field. Zero marks a code with no whole-number Hz
 // value (0.5 and 0.25 Hz) or a reserved one, and is never selectable.
 static const uint16_t tap_rate_hz[16] = {32, 16, 8, 4, 2, 1, 0, 0,
                                          64, 128, 256, 0, 0, 0, 0, 0};
+
+// Whether this boot is the glasses waking to two taps, so the app can carry
+// on rather than greet them with a banner. A cold boot, a reset or waking
+// in the charging case all return false.
+static int lua_imu_woke_by_tap(lua_State *L)
+{
+    lua_pushboolean(L, imu_woke_by_tap);
+    return 1;
+}
 
 static int lua_imu_tap_config(lua_State *L)
 {
@@ -472,6 +517,9 @@ void lua_open_imu_library(lua_State *L)
 
     lua_pushcfunction(L, lua_imu_tap_config);
     lua_setfield(L, -2, "tap_config");
+
+    lua_pushcfunction(L, lua_imu_woke_by_tap);
+    lua_setfield(L, -2, "woke_by_tap");
 
     lua_pushcfunction(L, lua_imu_direction);
     lua_setfield(L, -2, "direction");
