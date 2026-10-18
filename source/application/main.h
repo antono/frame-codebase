@@ -31,5 +31,7 @@ extern bool stay_awake;
 
 void shutdown(bool enable_imu_wakeup);
 void imu_prepare_wakeup(void);
+bool imu_wait_for_second_tap(void);
+extern bool imu_woke_by_tap;
 
 const char *get_hardware_string(void);

@@ -81,47 +81,13 @@ static void set_power_rails(bool enable)
     check_error(i2c_write(PMIC, 0x2A, 0x0F, 0x0C).fail);
 }
 
-void shutdown(bool enable_imu_wakeup)
+// Asleep waiting for taps. See imu_wait_for_second_tap() in imu.c
+#define WAKE_ON_TAPS 0x5A
+
+// The last step of going to sleep, from rails already off. Also how boot
+// goes back to sleep after one tap that no second tap followed.
+static void system_off(bool enable_imu_wakeup)
 {
-    nrfx_gpiote_trigger_disable(CASE_DETECT_PIN);
-
-    if (stay_awake)
-    {
-        LOG("Staying awake");
-        // Debounce and avoid the interrupt being called multiple times
-        nrfx_systick_delay_ms(100);
-        nrfx_gpiote_trigger_enable(CASE_DETECT_PIN, true);
-        return;
-    }
-
-    uint8_t display_power_save[1] = {0x92};
-    spi_write(DISPLAY, 0x00, display_power_save, sizeof(display_power_save));
-    nrfx_systick_delay_ms(50);
-
-    nrf_gpio_pin_write(CAMERA_SLEEP_PIN, false);
-
-    // Put magnetometer into standby
-    check_error(i2c_write(MAGNETOMETER, 0x1B, 0x80, 0x00).fail);
-
-    // Put accelerometer into standby if not needed for wakeup, otherwise
-    // leave it set up so that one tap wakes the glasses
-    if (!enable_imu_wakeup)
-    {
-        check_error(i2c_write(ACCELEROMETER, 0x07, 0xFF, 0x00).fail);
-    }
-    else
-    {
-        imu_prepare_wakeup();
-    }
-
-    nrf_gpio_pin_clear(FPGA_PROGRAM_PIN);
-    nrfx_systick_delay_ms(100);
-
-    check_error(sd_softdevice_disable());
-
-    set_power_rails(false);
-    nrfx_systick_delay_ms(100);
-
     // Disconnect AMUX
     check_error(i2c_write(PMIC, 0x28, 0x0F, 0x00).fail);
 
@@ -152,6 +118,11 @@ void shutdown(bool enable_imu_wakeup)
     // Clear the reset reasons
     NRF_POWER->RESETREAS = 0xF000F;
 
+    // Tell the next boot whether a tap woke it. GPREGRET2 survives System OFF
+    // (only power-on and brownout clear it); the bootloader reads it only
+    // for 0xA9 in its masked bits, which this value never matches.
+    NRF_POWER->GPREGRET2 = enable_imu_wakeup ? WAKE_ON_TAPS : 0;
+
     LOG("Going to sleep");
 
     NRF_POWER->SYSTEMOFF = 1;
@@ -161,6 +132,51 @@ void shutdown(bool enable_imu_wakeup)
     while (1)
     {
     }
+}
+
+void shutdown(bool enable_imu_wakeup)
+{
+    nrfx_gpiote_trigger_disable(CASE_DETECT_PIN);
+
+    if (stay_awake)
+    {
+        LOG("Staying awake");
+        // Debounce and avoid the interrupt being called multiple times
+        nrfx_systick_delay_ms(100);
+        nrfx_gpiote_trigger_enable(CASE_DETECT_PIN, true);
+        return;
+    }
+
+    uint8_t display_power_save[1] = {0x92};
+    spi_write(DISPLAY, 0x00, display_power_save, sizeof(display_power_save));
+    nrfx_systick_delay_ms(50);
+
+    nrf_gpio_pin_write(CAMERA_SLEEP_PIN, false);
+
+    // Put magnetometer into standby
+    check_error(i2c_write(MAGNETOMETER, 0x1B, 0x80, 0x00).fail);
+
+    // Put accelerometer into standby if not needed for wakeup, otherwise
+    // leave it set up so that a tap wakes the glasses (and a second one
+    // keeps them awake, see hardware_setup())
+    if (!enable_imu_wakeup)
+    {
+        check_error(i2c_write(ACCELEROMETER, 0x07, 0xFF, 0x00).fail);
+    }
+    else
+    {
+        imu_prepare_wakeup();
+    }
+
+    nrf_gpio_pin_clear(FPGA_PROGRAM_PIN);
+    nrfx_systick_delay_ms(100);
+
+    check_error(sd_softdevice_disable());
+
+    set_power_rails(false);
+    nrfx_systick_delay_ms(100);
+
+    system_off(enable_imu_wakeup);
 }
 
 const char *get_hardware_string(void)
@@ -248,6 +264,25 @@ static void hardware_setup()
             {
                 error_with_message("PMIC not found");
             }
+        }
+    }
+
+    // Woken from sleep by a tap: it takes a second one to stay awake. In the
+    // charging case boot carries on as before; the case logic below decides.
+    {
+        bool waiting_for_taps = NRF_POWER->GPREGRET2 == WAKE_ON_TAPS;
+        NRF_POWER->GPREGRET2 = 0;
+
+        if (waiting_for_taps && not_real_hardware == false &&
+            i2c_read(PMIC, 0x03, 0x0C).value == 0)
+        {
+            if (!imu_wait_for_second_tap())
+            {
+                LOG("One tap only, back to sleep");
+                system_off(true);
+            }
+
+            imu_woke_by_tap = true;
         }
     }
 
