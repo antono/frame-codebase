@@ -410,6 +410,32 @@ static int lua_file_listdir(lua_State *L)
     return 1;
 }
 
+static int lua_file_space(lua_State *L)
+{
+    lfs_ssize_t used_blocks = lfs_fs_size(&filesystem);
+
+    if (used_blocks < 0)
+    {
+        luaL_error(L, "error reading filesystem size");
+    }
+
+    lfs_size_t block_size = filesystem_config.block_size;
+    lfs_size_t total_blocks = filesystem_config.block_count;
+
+    lua_newtable(L);
+
+    lua_pushinteger(L, total_blocks * block_size);
+    lua_setfield(L, -2, "total");
+
+    lua_pushinteger(L, (lua_Integer)used_blocks * block_size);
+    lua_setfield(L, -2, "used");
+
+    lua_pushinteger(L, (total_blocks - used_blocks) * block_size);
+    lua_setfield(L, -2, "free");
+
+    return 1;
+}
+
 static int lua_file_require(lua_State *L)
 {
     file_stream_t stream;
@@ -526,6 +552,9 @@ void lua_open_file_library(lua_State *L, bool reformat)
 
     lua_pushcfunction(L, lua_file_mkdir);
     lua_setfield(L, -2, "mkdir");
+
+    lua_pushcfunction(L, lua_file_space);
+    lua_setfield(L, -2, "space");
 
     lua_setfield(L, -2, "file");
     lua_pop(L, 1);
