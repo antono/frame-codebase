@@ -13,3 +13,13 @@ Generate the font pack using the `create_sprites` command:
 ```sh
 frameutils create_sprites -c 2 --header source/application/lua_libraries/graphical_assets source/application/lua_libraries/graphical_assets/system_font.h
 ```
+## Monospace fonts
+
+`mono_font.h`, the fonts of `frame.display.mono`, is not made from PNGs:
+`mono.py` writes it from the Terminus Font source (BDF, SIL OFL 1.1,
+`fonts/Terminus-OFL.txt`), printable ASCII in sizes 20, 24, 28 and 32,
+normal and bold:
+
+```sh
+python3 mono.py $(nix build --no-link --print-out-paths nixpkgs#terminus_font.src)
+```

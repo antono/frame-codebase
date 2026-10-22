@@ -29,6 +29,7 @@
 #include "nrfx_systick.h"
 #include "spi.h"
 #include "system_font.h"
+#include "mono_font.h"
 #include "nrfx_log.h"
 
 typedef struct colors_t
@@ -371,6 +372,184 @@ static int lua_display_text(lua_State *L)
     return 0;
 }
 
+// The palette offset that draws a 1 bit of a 2 color sprite in this color
+static lua_Integer color_offset(lua_State *L, const char *name)
+{
+    for (size_t i = 1; i < 16; i++)
+    {
+        if (strcmp(name, colors[i].name) == 0)
+        {
+            return i - 1;
+        }
+    }
+
+    luaL_error(L, "Invalid color name");
+    return 0;
+}
+
+// frame.display.mono(string, x, y, {size, bold, color, bg}): the string in a
+// monospace font (mono_font.h), a cell size/2 by size pixels for every
+// character. Printable ASCII is drawn; any other character leaves its cell
+// blank. bg fills the cells first. What would run past the right edge is
+// left out. Returns the x after the last cell drawn. The whole string goes
+// as one sprite, and bg as one more.
+static int lua_display_mono(lua_State *L)
+{
+    size_t length;
+    const char *string = luaL_checklstring(L, 1, &length);
+    lua_Integer x_position = luaL_checkinteger(L, 2);
+    lua_Integer y_position = luaL_checkinteger(L, 3);
+    lua_Integer size = 24;
+    bool bold = false;
+    lua_Integer color_palette_offset = 0;
+    lua_Integer bg_palette_offset = -1;
+
+    if (lua_istable(L, 4))
+    {
+        if (lua_getfield(L, 4, "size") != LUA_TNIL)
+        {
+            size = luaL_checkinteger(L, -1);
+        }
+        lua_pop(L, 1);
+
+        if (lua_getfield(L, 4, "bold") != LUA_TNIL)
+        {
+            bold = lua_toboolean(L, -1);
+        }
+        lua_pop(L, 1);
+
+        if (lua_getfield(L, 4, "color") != LUA_TNIL)
+        {
+            color_palette_offset = color_offset(L, luaL_checkstring(L, -1));
+        }
+        lua_pop(L, 1);
+
+        if (lua_getfield(L, 4, "bg") != LUA_TNIL)
+        {
+            bg_palette_offset = color_offset(L, luaL_checkstring(L, -1));
+        }
+        lua_pop(L, 1);
+    }
+
+    const mono_font_t *font = NULL;
+    for (size_t i = 0; i < sizeof(mono_fonts) / sizeof(mono_font_t); i++)
+    {
+        if (mono_fonts[i].size == size && mono_fonts[i].bold == bold)
+        {
+            font = &mono_fonts[i];
+            break;
+        }
+    }
+
+    if (font == NULL)
+    {
+        luaL_error(L, "size must be 20, 24, 28 or 32");
+    }
+
+    if (x_position < 1 || x_position > 640)
+    {
+        luaL_error(L, "x_position must be between 1 and 640 pixels");
+    }
+
+    if (y_position < 1 || y_position > 400)
+    {
+        luaL_error(L, "y_position must be between 1 and 400 pixels");
+    }
+
+    // A cell for every character: every byte but UTF-8 continuation bytes
+    size_t cells = 0;
+    for (size_t i = 0; i < length; i++)
+    {
+        if (((uint8_t)string[i] & 0b11000000) != 0b10000000)
+        {
+            cells++;
+        }
+    }
+
+    size_t fit = (640 - (x_position - 1)) / font->width;
+    if (cells > fit)
+    {
+        cells = fit;
+    }
+
+    if (cells == 0 || y_position - 1 + font->height > 400)
+    {
+        lua_pushinteger(L, x_position);
+        return 1;
+    }
+
+    // Cells are an even number of pixels wide: whole bytes, no padding
+    size_t row_width = cells * font->width;
+    size_t data_length = row_width * font->height / 8;
+    uint8_t *data = malloc(data_length);
+    if (data == NULL)
+    {
+        error();
+    }
+
+    if (bg_palette_offset >= 0)
+    {
+        memset(data, 0xFF, data_length);
+        draw_sprite(L,
+                    x_position,
+                    y_position,
+                    row_width,
+                    2,
+                    bg_palette_offset,
+                    data,
+                    data_length);
+    }
+
+    memset(data, 0, data_length);
+    bool ink = false;
+    size_t cell = 0;
+    for (size_t i = 0; i < length && cell < cells; i++)
+    {
+        uint8_t c = (uint8_t)string[i];
+        if ((c & 0b11000000) == 0b10000000)
+        {
+            continue;
+        }
+
+        if (c >= MONO_FIRST && c <= MONO_LAST)
+        {
+            const uint16_t *glyph = font->rows + (c - MONO_FIRST) * font->height;
+            for (size_t row = 0; row < font->height; row++)
+            {
+                uint16_t bits = glyph[row];
+                for (size_t col = 0; bits != 0; col++, bits <<= 1)
+                {
+                    if (bits & 0x8000)
+                    {
+                        size_t bit = row * row_width + cell * font->width + col;
+                        data[bit / 8] |= 0x80 >> (bit % 8);
+                        ink = true;
+                    }
+                }
+            }
+        }
+
+        cell++;
+    }
+
+    if (ink)
+    {
+        draw_sprite(L,
+                    x_position,
+                    y_position,
+                    row_width,
+                    2,
+                    color_palette_offset,
+                    data,
+                    data_length);
+    }
+
+    free(data);
+
+    lua_pushinteger(L, x_position + row_width);
+    return 1;
+}
+
 static int lua_display_show(lua_State *L)
 {
     spi_write(FPGA, 0x14, NULL, 0);
@@ -459,6 +638,9 @@ void lua_open_display_library(lua_State *L)
 
     lua_pushcfunction(L, lua_display_text);
     lua_setfield(L, -2, "text");
+
+    lua_pushcfunction(L, lua_display_mono);
+    lua_setfield(L, -2, "mono");
 
     lua_pushcfunction(L, lua_display_show);
     lua_setfield(L, -2, "show");
