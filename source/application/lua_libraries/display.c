@@ -203,6 +203,50 @@ static int lua_display_assign_color_ycbcr(lua_State *L)
     return 0;
 }
 
+// malloc, with Lua's garbage collected first when the heap is full. C shares
+// the heap with Lua, and Lua leaves its garbage until it needs the room: a
+// NULL here was error(), a reset (seen: a few screens of mono with the app's
+// garbage around). Now it is an error Lua can catch.
+static void *malloc_collecting(lua_State *L, size_t size)
+{
+    void *memory = malloc(size);
+    if (memory == NULL)
+    {
+        lua_gc(L, LUA_GCCOLLECT);
+        memory = malloc(size);
+    }
+
+    if (memory == NULL)
+    {
+        luaL_error(L, "not enough memory");
+    }
+
+    return memory;
+}
+
+#define SPRITE_META_LENGTH 8
+
+// The 8 bytes the FPGA takes before a sprite's pixels. x and y are Lua's,
+// 1 based, and already checked.
+static void write_sprite_meta(uint8_t *meta,
+                              lua_Integer x_position,
+                              lua_Integer y_position,
+                              lua_Integer width,
+                              lua_Integer total_colors,
+                              lua_Integer palette_offset)
+{
+    x_position--;
+    y_position--;
+    meta[0] = (uint32_t)x_position >> 8;
+    meta[1] = (uint32_t)x_position;
+    meta[2] = (uint32_t)y_position >> 8;
+    meta[3] = (uint32_t)y_position;
+    meta[4] = (uint32_t)width >> 8;
+    meta[5] = (uint32_t)width;
+    meta[6] = (uint8_t)total_colors;
+    meta[7] = (uint8_t)palette_offset;
+}
+
 static void draw_sprite(lua_State *L,
                         lua_Integer x_position,
                         lua_Integer y_position,
@@ -237,30 +281,19 @@ static void draw_sprite(lua_State *L,
         luaL_error(L, "palette_offset must be between 0 and 15");
     }
 
-    // Remove Lua 1 based offset before sending
-    x_position--;
-    y_position--;
-
-    uint8_t meta_data[8] = {(uint32_t)x_position >> 8,
-                            (uint32_t)x_position,
-                            (uint32_t)y_position >> 8,
-                            (uint32_t)y_position,
-                            (uint32_t)width >> 8,
-                            (uint32_t)width,
-                            (uint8_t)total_colors,
-                            (uint8_t)palette_offset};
-
-    uint8_t *payload = malloc(pixel_data_length + sizeof(meta_data));
-    if (payload == NULL)
-    {
-        error();
-    }
-    memcpy(payload, meta_data, sizeof(meta_data));
-    memcpy(payload + sizeof(meta_data), pixel_data, pixel_data_length);
+    uint8_t *payload =
+        malloc_collecting(L, pixel_data_length + SPRITE_META_LENGTH);
+    write_sprite_meta(payload,
+                      x_position,
+                      y_position,
+                      width,
+                      total_colors,
+                      palette_offset);
+    memcpy(payload + SPRITE_META_LENGTH, pixel_data, pixel_data_length);
     spi_write(FPGA,
               0x12,
               payload,
-              pixel_data_length + sizeof(meta_data));
+              pixel_data_length + SPRITE_META_LENGTH);
     free(payload);
 }
 
@@ -503,13 +536,12 @@ static int lua_display_mono(lua_State *L)
         return 1;
     }
 
-    // Cells are an even number of pixels wide: whole bytes, no padding
+    // Cells are an even number of pixels wide: whole bytes, no padding. The
+    // sprites go from this one buffer, the FPGA's 8 bytes in front: nothing
+    // else is allocated, so nothing can fail and leave it behind.
     size_t data_length = cells * font->width * font->height / 8;
-    uint8_t *data = malloc(data_length);
-    if (data == NULL)
-    {
-        error();
-    }
+    uint8_t *buffer = malloc_collecting(L, SPRITE_META_LENGTH + data_length);
+    uint8_t *data = buffer + SPRITE_META_LENGTH;
 
     // Backgrounds first, then text over them; palette index 0 is nothing
     for (int pass = 0; pass < 2; pass++)
@@ -568,19 +600,18 @@ static int lua_display_mono(lua_State *L)
 
             if (ink)
             {
-                draw_sprite(L,
-                            x_position + first * font->width,
-                            y_position,
-                            row_width,
-                            2,
-                            index - 1,
-                            data,
-                            span_length);
+                write_sprite_meta(buffer,
+                                  x_position + first * font->width,
+                                  y_position,
+                                  row_width,
+                                  2,
+                                  index - 1);
+                spi_write(FPGA, 0x12, buffer, SPRITE_META_LENGTH + span_length);
             }
         }
     }
 
-    free(data);
+    free(buffer);
 
     lua_pushinteger(L, x_position + cells * font->width);
     return 1;
