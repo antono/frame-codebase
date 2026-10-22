@@ -387,12 +387,23 @@ static lua_Integer color_offset(lua_State *L, const char *name)
     return 0;
 }
 
-// frame.display.mono(string, x, y, {size, bold, color, bg}): the string in a
-// monospace font (mono_font.h), a cell size/2 by size pixels for every
-// character. Printable ASCII is drawn; any other character leaves its cell
-// blank. bg fills the cells first. What would run past the right edge is
-// left out. Returns the x after the last cell drawn. The whole string goes
-// as one sprite, and bg as one more.
+// frame.display.mono(string, x, y, {size, bold, color, bg, attrs}): the
+// string in a monospace font (mono_font.h), a cell size/2 by size pixels for
+// every character. Printable ASCII is drawn; any other character leaves its
+// cell blank. What would run past the right edge is left out. Returns the x
+// after the last cell drawn.
+//
+// color and bg name the colors of the whole string, bg none by default.
+// attrs, a string, gives each cell its own instead, a byte a cell: the low
+// nibble the palette index of the text (0: color), the high one of the
+// background (0: none). Cells past the end of attrs take color and bg.
+//
+// One sprite goes out for each background color and each text color in the
+// string, as wide as from its first cell to its last: a row of a terminal is
+// a few sprites, not one a character. Hundreds of small sprites before a
+// show() have rebooted the glasses (docs/FRAME.md in glaz).
+#define MONO_MAX_CELLS (640 / 10)
+
 static int lua_display_mono(lua_State *L)
 {
     size_t length;
@@ -401,8 +412,10 @@ static int lua_display_mono(lua_State *L)
     lua_Integer y_position = luaL_checkinteger(L, 3);
     lua_Integer size = 24;
     bool bold = false;
-    lua_Integer color_palette_offset = 0;
-    lua_Integer bg_palette_offset = -1;
+    uint8_t color = 1;
+    uint8_t bg = 0;
+    size_t attrs_length = 0;
+    const char *attrs = NULL;
 
     if (lua_istable(L, 4))
     {
@@ -420,13 +433,20 @@ static int lua_display_mono(lua_State *L)
 
         if (lua_getfield(L, 4, "color") != LUA_TNIL)
         {
-            color_palette_offset = color_offset(L, luaL_checkstring(L, -1));
+            color = color_offset(L, luaL_checkstring(L, -1)) + 1;
         }
         lua_pop(L, 1);
 
         if (lua_getfield(L, 4, "bg") != LUA_TNIL)
         {
-            bg_palette_offset = color_offset(L, luaL_checkstring(L, -1));
+            bg = color_offset(L, luaL_checkstring(L, -1)) + 1;
+        }
+        lua_pop(L, 1);
+
+        // stays referenced by the options table while this runs
+        if (lua_getfield(L, 4, "attrs") != LUA_TNIL)
+        {
+            attrs = luaL_checklstring(L, -1, &attrs_length);
         }
         lua_pop(L, 1);
     }
@@ -457,19 +477,24 @@ static int lua_display_mono(lua_State *L)
     }
 
     // A cell for every character: every byte but UTF-8 continuation bytes
-    size_t cells = 0;
-    for (size_t i = 0; i < length; i++)
-    {
-        if (((uint8_t)string[i] & 0b11000000) != 0b10000000)
-        {
-            cells++;
-        }
-    }
-
     size_t fit = (640 - (x_position - 1)) / font->width;
-    if (cells > fit)
+    uint8_t codes[MONO_MAX_CELLS];
+    uint8_t fgs[MONO_MAX_CELLS];
+    uint8_t bgs[MONO_MAX_CELLS];
+    size_t cells = 0;
+    for (size_t i = 0; i < length && cells < fit; i++)
     {
-        cells = fit;
+        uint8_t c = (uint8_t)string[i];
+        if ((c & 0b11000000) == 0b10000000)
+        {
+            continue;
+        }
+
+        uint8_t a = cells < attrs_length ? (uint8_t)attrs[cells] : 0;
+        codes[cells] = c >= MONO_FIRST && c <= MONO_LAST ? c : 0;
+        fgs[cells] = (a & 0x0F) ? (a & 0x0F) : color;
+        bgs[cells] = cells < attrs_length ? a >> 4 : bg;
+        cells++;
     }
 
     if (cells == 0 || y_position - 1 + font->height > 400)
@@ -479,74 +504,85 @@ static int lua_display_mono(lua_State *L)
     }
 
     // Cells are an even number of pixels wide: whole bytes, no padding
-    size_t row_width = cells * font->width;
-    size_t data_length = row_width * font->height / 8;
+    size_t data_length = cells * font->width * font->height / 8;
     uint8_t *data = malloc(data_length);
     if (data == NULL)
     {
         error();
     }
 
-    if (bg_palette_offset >= 0)
+    // Backgrounds first, then text over them; palette index 0 is nothing
+    for (int pass = 0; pass < 2; pass++)
     {
-        memset(data, 0xFF, data_length);
-        draw_sprite(L,
-                    x_position,
-                    y_position,
-                    row_width,
-                    2,
-                    bg_palette_offset,
-                    data,
-                    data_length);
-    }
-
-    memset(data, 0, data_length);
-    bool ink = false;
-    size_t cell = 0;
-    for (size_t i = 0; i < length && cell < cells; i++)
-    {
-        uint8_t c = (uint8_t)string[i];
-        if ((c & 0b11000000) == 0b10000000)
+        uint8_t *of = pass == 0 ? bgs : fgs;
+        for (uint8_t index = 1; index < 16; index++)
         {
-            continue;
-        }
-
-        if (c >= MONO_FIRST && c <= MONO_LAST)
-        {
-            const uint16_t *glyph = font->rows + (c - MONO_FIRST) * font->height;
-            for (size_t row = 0; row < font->height; row++)
+            size_t first = cells, last = 0;
+            for (size_t i = 0; i < cells; i++)
             {
-                uint16_t bits = glyph[row];
-                for (size_t col = 0; bits != 0; col++, bits <<= 1)
+                if (of[i] == index && (pass == 0 || codes[i] != 0))
                 {
-                    if (bits & 0x8000)
+                    if (first == cells)
                     {
-                        size_t bit = row * row_width + cell * font->width + col;
-                        data[bit / 8] |= 0x80 >> (bit % 8);
-                        ink = true;
+                        first = i;
+                    }
+                    last = i;
+                }
+            }
+
+            if (first == cells)
+            {
+                continue;
+            }
+
+            size_t row_width = (last - first + 1) * font->width;
+            size_t span_length = row_width * font->height / 8;
+            memset(data, 0, span_length);
+            bool ink = false;
+            for (size_t i = first; i <= last; i++)
+            {
+                if (of[i] != index)
+                {
+                    continue;
+                }
+
+                const uint16_t *glyph =
+                    codes[i] ? font->rows + (codes[i] - MONO_FIRST) * font->height
+                             : NULL;
+                for (size_t row = 0; row < font->height; row++)
+                {
+                    uint16_t bits = pass == 0 ? (uint16_t)(0xFFFF << (16 - font->width))
+                                    : glyph ? glyph[row]
+                                            : 0;
+                    for (size_t col = 0; bits != 0; col++, bits <<= 1)
+                    {
+                        if (bits & 0x8000)
+                        {
+                            size_t bit = row * row_width + (i - first) * font->width + col;
+                            data[bit / 8] |= 0x80 >> (bit % 8);
+                            ink = true;
+                        }
                     }
                 }
             }
+
+            if (ink)
+            {
+                draw_sprite(L,
+                            x_position + first * font->width,
+                            y_position,
+                            row_width,
+                            2,
+                            index - 1,
+                            data,
+                            span_length);
+            }
         }
-
-        cell++;
-    }
-
-    if (ink)
-    {
-        draw_sprite(L,
-                    x_position,
-                    y_position,
-                    row_width,
-                    2,
-                    color_palette_offset,
-                    data,
-                    data_length);
     }
 
     free(data);
 
-    lua_pushinteger(L, x_position + row_width);
+    lua_pushinteger(L, x_position + cells * font->width);
     return 1;
 }
 
