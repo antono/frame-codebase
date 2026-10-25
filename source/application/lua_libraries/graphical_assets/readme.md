@@ -23,3 +23,14 @@ normal and bold:
 ```sh
 python3 mono.py $(nix build --no-link --print-out-paths nixpkgs#terminus_font.src)
 ```
+
+## Emoji
+
+The 137 most used emoji (Unicode's frequency list) are in the system font
+at their own codepoints, two colors, 40 pixels tall. `emoji.py` draws
+them as `U+XXXX.png` from Noto Emoji, the monochrome one (SIL OFL 1.1,
+`fonts/NotoEmoji-OFL.txt`); then build `system_font.h` as above:
+
+```sh
+python3 emoji.py $(nix build --no-link --print-out-paths nixpkgs#noto-fonts-monochrome-emoji)/share/fonts/noto/NotoEmoji.ttf
+```
