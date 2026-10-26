@@ -23,6 +23,7 @@
  */
 
 #include <math.h>
+#include <string.h>
 #include "error_logging.h"
 #include "frame_lua_libraries.h"
 #include "i2c.h"
@@ -58,14 +59,20 @@ static void lua_imu_tap_callback_handler(lua_State *L, lua_Debug *ar)
 {
     sethook_watchdog(L);
 
-    // Clear the interrupt by reading the status register
-    check_error(i2c_read(ACCELEROMETER, 0x03, 0xFF).fail);
+    // Reading the status register clears the interrupt. Its low six bits
+    // say which way the tap pushed the part, in the same order as the
+    // enables in 0x06 and TAPEN: X+ X- Y+ Y- Z+ Z- (datasheet table 17; bit
+    // 7 is ACQ_INT). The callback gets the whole byte; one that takes no
+    // argument is unaffected.
+    i2c_response_t status = i2c_read(ACCELEROMETER, 0x03, 0xFF);
+    check_error(status.fail);
 
     if (lua_imu_callback_function != 0)
     {
         lua_rawgeti(L, LUA_REGISTRYINDEX, lua_imu_callback_function);
+        lua_pushinteger(L, status.value);
 
-        if (lua_pcall(L, 0, 0, 0) != LUA_OK)
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK)
         {
             luaL_error(L, "%s", lua_tostring(L, -1));
         }
@@ -225,6 +232,7 @@ static int lua_imu_raw(lua_State *L)
 //   0x08 SRTFR  TAP_LATCH | FLIP_* | RATE[3:0]
 //   0x09 TAPEN  TAP_EN | THRDUR | per-axis enables
 //   0x0A-0x0C   THRDUR=1 -> threshold; THRDUR=0 -> QUIET[7:4] | DUR[3:0]
+//               one register per axis: 0x0A X, 0x0B Y, 0x0C Z
 //
 // Each of 0x0A to 0x0C is two registers in one, selected by THRDUR. Stock
 // firmware only ever wrote the threshold, leaving QUIET and DUR at their
@@ -235,7 +243,7 @@ typedef struct
     uint8_t rate;       // RATE[3:0] field value; 0x0A is 256 Hz
     bool latch;         // TAP_LATCH: ignore further taps until 0x03 is read
     uint8_t axes;       // TAPEN bits 5:0, also mirrored into INTEN
-    uint8_t threshold;  // written while THRDUR = 1
+    uint8_t threshold[3]; // X, Y, Z: 0x0A to 0x0C while THRDUR = 1
     uint8_t quiet;      // 0..15, high nibble while THRDUR = 0
     uint8_t duration;   // 0..15, low nibble while THRDUR = 0
 } tap_settings_t;
@@ -244,7 +252,7 @@ static const tap_settings_t tap_defaults = {
     .rate = 0x0A,       // 256 Hz
     .latch = true,
     .axes = 0x08,       // -Y only, which is how the part is mounted
-    .threshold = 0x07,
+    .threshold = {0x07, 0x07, 0x07},
     .quiet = 0,         // stock values: no quiet period, no minimum duration
     .duration = 0,
 };
@@ -276,19 +284,16 @@ static void imu_apply_tap_settings(void)
     check_error(i2c_write(ACCELEROMETER, 0x0B, 0xFF, quiet_dur).fail);
     check_error(i2c_write(ACCELEROMETER, 0x0C, 0xFF, quiet_dur).fail);
 
-    // THRDUR = 1: the same addresses now hold the threshold
+    // THRDUR = 1: the same addresses now hold each axis's threshold
     check_error(i2c_write(ACCELEROMETER, 0x09, 0xFF,
                           0xC0 | (tap_settings.axes & 0x3F))
                     .fail);
-    check_error(i2c_write(ACCELEROMETER, 0x0A, 0xFF,
-                          tap_settings.threshold)
-                    .fail);
-    check_error(i2c_write(ACCELEROMETER, 0x0B, 0xFF,
-                          tap_settings.threshold)
-                    .fail);
-    check_error(i2c_write(ACCELEROMETER, 0x0C, 0xFF,
-                          tap_settings.threshold)
-                    .fail);
+    for (uint8_t axis = 0; axis < 3; axis++)
+    {
+        check_error(i2c_write(ACCELEROMETER, 0x0A + axis, 0xFF,
+                              tap_settings.threshold[axis])
+                        .fail);
+    }
 
     // Set INTA as push-pull active-high and come out of standby
     check_error(i2c_write(ACCELEROMETER, 0x07, 0xFF, 0xC1).fail);
@@ -366,6 +371,53 @@ static int lua_imu_woke_by_tap(lua_State *L)
     return 1;
 }
 
+static const char *const tap_axis_names[3] = {"x", "y", "z"};
+
+static uint8_t tap_check_threshold(lua_State *L, int index)
+{
+    lua_Integer value = luaL_checkinteger(L, index);
+    if (value < 0 || value > 255)
+    {
+        luaL_error(L, "threshold must be between 0 and 255");
+    }
+    return (uint8_t)value;
+}
+
+// Per-axis table at the top of the stack, {x =, y =, z =}: sets the axes it
+// names. Anything else in it, a list or {X = 7}, is an error rather than a
+// silent no-op, and so is a table that names no axis.
+static void tap_set_thresholds(lua_State *L)
+{
+    uint8_t threshold[3];
+    memcpy(threshold, tap_settings.threshold, sizeof(threshold));
+    bool named = false;
+
+    lua_pushnil(L);
+    while (lua_next(L, -2) != 0)
+    {
+        uint8_t axis = 0;
+        while (axis < 3 && !(lua_type(L, -2) == LUA_TSTRING &&
+                             strcmp(lua_tostring(L, -2),
+                                    tap_axis_names[axis]) == 0))
+        {
+            axis++;
+        }
+        if (axis == 3)
+        {
+            luaL_error(L, "threshold table takes only x, y and z");
+        }
+        threshold[axis] = tap_check_threshold(L, -1);
+        named = true;
+        lua_pop(L, 1);
+    }
+
+    if (named == false)
+    {
+        luaL_error(L, "threshold table names no axis; use x, y or z");
+    }
+    memcpy(tap_settings.threshold, threshold, sizeof(threshold));
+}
+
 static int lua_imu_tap_config(lua_State *L)
 {
     // No argument: report what is programmed, so a calibration app can show
@@ -374,8 +426,22 @@ static int lua_imu_tap_config(lua_State *L)
     {
         lua_newtable(L);
 
-        lua_pushinteger(L, tap_settings.threshold);
-        lua_setfield(L, -2, "threshold");
+        // "threshold" stays a plain integer while the three axes agree, so
+        // callers that predate per-axis thresholds still round-trip it
+        if (tap_settings.threshold[0] == tap_settings.threshold[1] &&
+            tap_settings.threshold[1] == tap_settings.threshold[2])
+        {
+            lua_pushinteger(L, tap_settings.threshold[0]);
+            lua_setfield(L, -2, "threshold");
+        }
+
+        lua_newtable(L);
+        for (uint8_t axis = 0; axis < 3; axis++)
+        {
+            lua_pushinteger(L, tap_settings.threshold[axis]);
+            lua_setfield(L, -2, tap_axis_names[axis]);
+        }
+        lua_setfield(L, -2, "thresholds");
 
         lua_pushinteger(L, tap_settings.quiet);
         lua_setfield(L, -2, "quiet");
@@ -397,14 +463,34 @@ static int lua_imu_tap_config(lua_State *L)
 
     luaL_checktype(L, 1, LUA_TTABLE);
 
-    if (lua_getfield(L, 1, "threshold") != LUA_TNIL)
+    // "thresholds" is what the getter returns, so its table round-trips.
+    // It goes first: a caller that edits "threshold" in that table and
+    // passes it back gets the edit, not the stale per-axis values.
+    int thresholds_type = lua_getfield(L, 1, "thresholds");
+    if (thresholds_type == LUA_TTABLE)
     {
-        lua_Integer value = luaL_checkinteger(L, -1);
-        if (value < 0 || value > 255)
+        tap_set_thresholds(L);
+    }
+    else if (thresholds_type != LUA_TNIL)
+    {
+        luaL_error(L, "thresholds must be a table {x =, y =, z =}");
+    }
+    lua_pop(L, 1);
+
+    // threshold = 7 sets all three axes; threshold = {x = 7, z = 9} sets
+    // only the axes it names
+    int threshold_type = lua_getfield(L, 1, "threshold");
+    if (threshold_type == LUA_TTABLE)
+    {
+        tap_set_thresholds(L);
+    }
+    else if (threshold_type != LUA_TNIL)
+    {
+        uint8_t value = tap_check_threshold(L, -1);
+        for (uint8_t axis = 0; axis < 3; axis++)
         {
-            luaL_error(L, "threshold must be between 0 and 255");
+            tap_settings.threshold[axis] = value;
         }
-        tap_settings.threshold = (uint8_t)value;
     }
     lua_pop(L, 1);
 
