@@ -97,6 +97,18 @@ static void system_off(bool enable_imu_wakeup)
     // Set ICHGIN_LIM to 285mA
     check_error(i2c_write(PMIC, 0x21, 0x1C, 0x08).fail);
 
+    // The last I2C before sleep, while its pins are still set up: drop a tap
+    // still latched (TAP_LATCH holds INTA until 0x03 is read), which would
+    // keep the glasses asleep through every tap after it. Clearing it in
+    // imu_prepare_wakeup() is not enough: from there to here is half a
+    // second, and a knock in it -- a step, taking the glasses off -- latched
+    // again. Going back to sleep after one tap at boot never cleared it at
+    // all. Not checked: a failed read must not stop sleep.
+    if (enable_imu_wakeup)
+    {
+        i2c_read(ACCELEROMETER, 0x03, 0xFF);
+    }
+
     for (uint8_t pin = 0; pin < 16; pin++)
     {
         nrf_gpio_cfg_default(NRF_GPIO_PIN_MAP(0, pin));
